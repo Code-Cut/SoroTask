@@ -15,12 +15,29 @@ pub mod state_channel;
 pub mod storage;
 pub mod task;
 pub mod upgrade;
+pub mod governance;
+pub mod escrow_pool;
+pub mod synthetic_arbitrageur;
 
 pub use gas::{get_gas_rates, update_gas_rates, EscrowManager, FeeBreakdown, GasMeter};
 pub use optimistic::{FraudProof, OptimisticClaim, CHALLENGE_WINDOW_LEDGERS};
 pub use state_channel::{ChannelCloseRequest, ChannelReceipt, ChannelState, ChannelStatus};
 pub use storage::{ExecutionLog, TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
+pub use governance::{
+    GovernanceConfig, GovernanceProposal, VoteChoice, VoteRecord, VoteSnapshot, VoteStatus,
+    DEFAULT_APPROVAL_THRESHOLD_BPS, DEFAULT_QUORUM_BPS, DEFAULT_VOTING_PERIOD_LEDGERS,
+    MIN_VOTING_PERIOD_LEDGERS,
+};
+pub use escrow_pool::{
+    DepositResult, EscrowPoolError, PoolConfig, SHARE_PRECISION, WithdrawalResult,
+    YIELD_PRECISION,
+};
+pub use synthetic_arbitrageur::{
+    ArbitrageConfig, ArbitrageError, ArbitrageRecord, ArbitrageResult, ArbitrageStatus,
+    DEFAULT_MAX_ARBITRAGE_PCT_BPS, DEFAULT_MAX_DEVIATION_BPS, DEFAULT_MIN_PROFIT_BPS,
+    FLASH_LOAN_FEE_BPS,
+};
 
 /// Pending execution commitment posted by a keeper in the commit phase.
 /// Stores the hash of (keeper_address, task_id, secret, block_target)
@@ -168,6 +185,23 @@ pub enum Error {
     ChannelNotClosing = 816,
     InvalidChannelParticipants = 817,
     ChannelNotClosed = 818,
+    // Governance errors (SC-PROD-37)
+    GovernanceProposalNotFound = 820,
+    GovernanceProposalNotActive = 821,
+    GovernanceVotingNotStarted = 822,
+    GovernanceVotingEnded = 823,
+    GovernanceQuorumNotReached = 824,
+    GovernanceProposalNotPassed = 825,
+    GovernanceAlreadyVoted = 826,
+    GovernanceInvalidVotingPower = 827,
+    GovernanceInvalidThreshold = 828,
+    GovernanceExecutionFailed = 829,
+    GovernanceSnapshotAlreadyExists = 830,
+    GovernanceInvalidProposalId = 831,
+    GovernanceVotingPeriodTooShort = 832,
+    GovernanceZeroVotingWeight = 833,
+    GovernanceMaxVotersReached = 834,
+    GovernanceEmergencyStopped = 835,
 }
 
 #[contracttype]
@@ -1330,6 +1364,43 @@ pub enum DataKey {
     ZkProofRecord(u64),
     /// Counter for sequential ZK proof records
     ZkProofCounter,
+
+    // ========== SC-PROD-37: Governance Vote Relayer ==========
+    /// Governance system configuration
+    GovernanceConfig,
+    /// Governance voting token address
+    GovernanceVotingToken,
+    /// Governance vote record: (proposal_id, voter)
+    GovernanceVote(u64, Address),
+    /// Vote snapshot for a proposal
+    GovernanceSnapshot(u64),
+
+    // ========== SC-PROD-36: Time-Locked Upgrade ==========
+    /// Guardian configuration for emergency upgrade actions
+    UpgradeGuardianConfig,
+    /// Public upgrade proposal with announcement data
+    PublicUpgradeProposal,
+
+    // ========== SC-PROD-34: Multi-Token Escrow Pool ==========
+    /// Escrow pool configuration
+    EscrowPoolConfig,
+    /// Token state in escrow pool
+    EscrowPoolTokenState(Address),
+    /// Virtual sub-account in escrow pool: (owner, token)
+    EscrowPoolSubAccount(Address, Address),
+
+    // ========== SC-PROD-33: Synthetic Asset Arbitrageur ==========
+    /// Arbitrage system configuration
+    ArbitrageConfig,
+    /// Synthetic token pair configuration
+    SyntheticTokenPair(Address),
+    /// Arbitrage execution record
+    ArbitrageRecord(u64),
+    /// Counter for arbitrage records
+    ArbitrageRecordCounter,
+    /// Simulated prices for testing
+    SimulatedSyntheticPrice(Address),
+    SimulatedUnderlyingPrice(Address),
 }
 
 /// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
