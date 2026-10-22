@@ -1,7 +1,283 @@
-// Keeper logger with W3C trace context injection and first-class structured logging.
-// Supports: structured application-level logging, correlation ID propagation, and
-// OpenTelemetry-compatible span export for distributed tracing across frontend, API
-// gateway, keeper priority queue, and Soroban contract execution.
+/**
+ * Structured Logging Module for SoroTask Keeper
+ *
+ * Uses pino for high-performance JSON logging with ECS & OpenTelemetry compliance:
+ * - ECS & standard fields: service, service_name, environment, trace_id, task_id, ledger_sequence
+ * - W3C TraceContext traceparent support
+ * - Automatic redaction of sensitive fields
+ * - NDJSON output in production conforming 100% to structured JSON schema
+ */
+
+const pino = require('pino');
+const { extractOrCreateTraceContext, parseTraceParent } = require('../../scripts/traceContext');
+const { AuditLogger, getAuditLogger } = require('./auditLogger');
+
+const SENSITIVE_FIELDS = [
+  'secret',
+  'secretKey',
+  'privateKey',
+  'password',
+  'token',
+  'apiKey',
+  'keeperSecret',
+  'KEEPER_SECRET',
+  'keypair',
+];
+
+const VALID_LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+
+function normalizeLogLevel(level) {
+  return VALID_LOG_LEVELS.includes(level) ? level : 'info';
+}
+
+function shouldUsePrettyTransport() {
+  return process.env.LOG_FORMAT === 'pretty';
+}
+
+/**
+ * Create base pino logger instance formatted for ECS / OpenTelemetry compatibility
+ */
+function createBaseLogger(overrides = {}, destination) {
+  const loggerOptions = {
+    level: normalizeLogLevel(process.env.LOG_LEVEL),
+    base: {
+      service: 'keeper',
+      service_name: 'keeper',
+      environment: process.env.NODE_ENV || 'production',
+      pid: process.pid,
+    },
+    redact: {
+      paths: SENSITIVE_FIELDS,
+      remove: true,
+    },
+    formatters: {
+      bindings(bindings) {
+        return {
+          service: 'keeper',
+          service_name: 'keeper',
+          environment: process.env.NODE_ENV || 'production',
+          pid: bindings.pid,
+          module: bindings.module,
+        };
+      },
+      level(label) {
+        return { level: label };
+      },
+      log(object) {
+        const formatted = { ...object };
+        if (formatted.traceId && !formatted.trace_id) {
+          formatted.trace_id = formatted.traceId;
+        }
+        if (formatted.taskId && !formatted.task_id) {
+          formatted.task_id = formatted.taskId;
+        }
+        if (formatted.ledgerSequence && !formatted.ledger_sequence) {
+          formatted.ledger_sequence = formatted.ledgerSequence;
+        }
+        return formatted;
+      },
+    },
+    messageKey: 'message',
+    timestamp: () => `,"timestamp":"${new Date().toISOString()}"`,
+    serializers: {
+      err: pino.stdSerializers.err,
+      error: pino.stdSerializers.err,
+    },
+    ...overrides,
+  };
+
+  if (shouldUsePrettyTransport()) {
+    loggerOptions.transport = loggerOptions.transport || {
+      target: 'pino-pretty',
+      options: {
+        colorize: true,
+        translateTime: 'SYS:standard',
+        ignore: 'pid,hostname',
+        messageFormat: '{module} - {msg}',
+      },
+    };
+  }
+
+  const logger = destination ? pino(loggerOptions, destination) : pino(loggerOptions);
+  logger.logFormat = shouldUsePrettyTransport() ? 'pretty' : 'json';
+  return logger;
+}
+
+let baseLogger = null;
+
+function getBaseLogger() {
+  if (!baseLogger) {
+    baseLogger = createBaseLogger();
+  }
+  return baseLogger;
+}
+
+function createLogger(module) {
+  const parent = getBaseLogger();
+  const child = parent.child({ module });
+
+  return {
+    trace: (msg, meta = {}) => {
+      child.trace(meta, msg);
+    },
+    debug: (msg, meta = {}) => {
+      child.debug(meta, msg);
+    },
+    info: (msg, meta = {}) => {
+      child.info(meta, msg);
+    },
+    warn: (msg, meta = {}) => {
+      child.warn(meta, msg);
+    },
+    error: (msg, meta = {}) => {
+      child.error(meta, msg);
+    },
+    fatal: (msg, meta = {}) => {
+      child.fatal(meta, msg);
+    },
+    audit: async (action, details = {}) => {
+      return await getAuditLogger().logAuditEntry(action, details);
+    },
+    raw: child,
+    childWithTrace: (correlationIdOrContext) => {
+      let traceMeta = {};
+      if (typeof correlationIdOrContext === 'string') {
+        const parsed = parseTraceParent(correlationIdOrContext);
+        if (parsed) {
+          traceMeta = {
+            traceparent: parsed.traceparent,
+            trace_id: parsed.traceId,
+            span_id: parsed.spanId,
+            correlationId: parsed.traceId,
+          };
+        } else {
+          traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        }
+      } else if (correlationIdOrContext && typeof correlationIdOrContext === 'object') {
+        traceMeta = { ...correlationIdOrContext };
+        if (traceMeta.traceparent) {
+          const parsed = parseTraceParent(traceMeta.traceparent);
+          if (parsed) {
+            traceMeta.trace_id = traceMeta.trace_id || parsed.traceId;
+            traceMeta.span_id = traceMeta.span_id || parsed.spanId;
+          }
+        }
+        if (traceMeta.traceId && !traceMeta.trace_id) {
+          traceMeta.trace_id = traceMeta.traceId;
+        }
+        if (traceMeta.txHash && !traceMeta.tx_hash) {
+          traceMeta.tx_hash = traceMeta.txHash;
+        }
+        if (traceMeta.rpcCall && !traceMeta.rpc_call) {
+          traceMeta.rpc_call = traceMeta.rpcCall;
+        }
+      }
+      const traceChild = child.child(traceMeta);
+      return createTracedLogger(traceChild, module);
+    },
+  };
+}
+
+function createTracedLogger(child, module) {
+  return {
+    trace: (msg, meta = {}) => {
+      child.trace(meta, msg);
+    },
+    debug: (msg, meta = {}) => {
+      child.debug(meta, msg);
+    },
+    info: (msg, meta = {}) => {
+      child.info(meta, msg);
+    },
+    warn: (msg, meta = {}) => {
+      child.warn(meta, msg);
+    },
+    error: (msg, meta = {}) => {
+      child.error(meta, msg);
+    },
+    fatal: (msg, meta = {}) => {
+      child.fatal(meta, msg);
+    },
+    audit: async (action, details = {}) => {
+      return await getAuditLogger().logAuditEntry(action, details);
+    },
+    raw: child,
+    childWithTrace: (correlationIdOrContext) => {
+      let traceMeta = {};
+      if (typeof correlationIdOrContext === 'string') {
+        const parsed = parseTraceParent(correlationIdOrContext);
+        if (parsed) {
+          traceMeta = {
+            traceparent: parsed.traceparent,
+            trace_id: parsed.traceId,
+            span_id: parsed.spanId,
+            correlationId: parsed.traceId,
+          };
+        } else {
+          traceMeta = { correlationId: correlationIdOrContext, trace_id: correlationIdOrContext };
+        }
+      } else if (correlationIdOrContext && typeof correlationIdOrContext === 'object') {
+        traceMeta = { ...correlationIdOrContext };
+        if (traceMeta.traceparent) {
+          const parsed = parseTraceParent(traceMeta.traceparent);
+          if (parsed) {
+            traceMeta.trace_id = traceMeta.trace_id || parsed.traceId;
+            traceMeta.span_id = traceMeta.span_id || parsed.spanId;
+          }
+        }
+        if (traceMeta.traceId && !traceMeta.trace_id) {
+          traceMeta.trace_id = traceMeta.traceId;
+        }
+        if (traceMeta.txHash && !traceMeta.tx_hash) {
+          traceMeta.tx_hash = traceMeta.txHash;
+        }
+        if (traceMeta.rpcCall && !traceMeta.rpc_call) {
+          traceMeta.rpc_call = traceMeta.rpcCall;
+        }
+      }
+      const traceChild = child.child(traceMeta);
+      return createTracedLogger(traceChild, module);
+    },
+  };
+}
+
+function createChildLogger(module) {
+  return createLogger(module);
+}
+
+function reinitializeLogger(options = {}) {
+  const { destination, ...loggerOptions } = options;
+  baseLogger = createBaseLogger(loggerOptions, destination);
+}
+
+function getLogLevel() {
+  return getBaseLogger().level;
+}
+
+function setLogLevel(level) {
+  getBaseLogger().level = level;
+}
+
+function injectW3CTraceContext(context = {}, traceId) {
+  const traceCtx = extractOrCreateTraceContext({ 'traceparent': context.traceparent || traceId });
+  context.traceparent = traceCtx.traceparent;
+  context.trace_id = traceCtx.traceId;
+  return context;
+}
+
+module.exports = {
+  createLogger,
+  createChildLogger,
+  getBaseLogger,
+  reinitializeLogger,
+  getLogLevel,
+  setLogLevel,
+  normalizeLogLevel,
+  SENSITIVE_FIELDS,
+  injectW3CTraceContext,
+  AuditLogger,
+  getAuditLogger,
+};
 
 const DEFAULT_OPTIONS = {
   level: 'info', // 'error' | 'warn' | 'info' | 'debug'
@@ -9,11 +285,11 @@ const DEFAULT_OPTIONS = {
   serviceName: 'keeper',
   version: '1.0.0',
   environment: process.env.NODE_ENV || 'development',
-  exporter: ensureConsoleExporter(),
+  exporter: null,
   correlationHeader: 'x-correlation-id',
   correlationCookie: 'x-correlation-id',
   sampler: samplerAlways,
-  spanStore: new InMemorySpanStore(),
+  spanStore: null,
 };
 
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
@@ -294,7 +570,7 @@ class ConsoleExporter {
               attributes: e.attributes,
               body: e.body,
               severityNumber: severityNumberForLevel(e.severityText),
-              timestamp: e.time 기흥구,
+              timestamp: e.time,
             })),
           }],
         }],
@@ -331,6 +607,9 @@ async function exportSpans(spans, exporter) {
   return exporter.export(spans);
 }
 
+DEFAULT_OPTIONS.exporter = ensureConsoleExporter();
+DEFAULT_OPTIONS.spanStore = new InMemorySpanStore();
+
 // ------------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------------
@@ -360,7 +639,6 @@ const logger = {
   endSpan,
 };
 
-module.exports = { logger, DEFAULT_OPTIONS, createTraceId, createSpanId, currentTraceId, currentSpanId, currentCorrelationId, setCurrentTraceContext, makeRootSpan, makeChildSpan, endSpan, extractCorrelationId, InMemorySpanStore, ConsoleExporter, severityNumberForLevel };
 
 // ------------------------------------------------------------------
 // Exporter for OTLP/gRPC services (kept as a no-op bridge for now)
@@ -376,3 +654,23 @@ async function otlpHttpExporter(opts = {}) {
 
 module.exports.otlpGrpcExporter = otlpGrpcExporter;
 module.exports.otlpHttpExporter = otlpHttpExporter;
+
+Object.assign(module.exports, {
+  logger,
+  DEFAULT_OPTIONS,
+  createTraceId,
+  createSpanId,
+  currentTraceId,
+  currentSpanId,
+  currentCorrelationId,
+  setCurrentTraceContext,
+  makeRootSpan,
+  makeChildSpan,
+  endSpan,
+  extractCorrelationId,
+  InMemorySpanStore,
+  ConsoleExporter,
+  severityNumberForLevel,
+  otlpGrpcExporter,
+  otlpHttpExporter,
+});

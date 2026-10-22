@@ -1,9 +1,11 @@
 const { Keypair, rpc, Networks, StrKey } = require('@stellar/stellar-sdk');
 const { Server } = rpc;
 const { createLogger } = require('./logger');
+const { AdaptiveGasTracker, getAdaptiveGasTracker } = require('./gasTracker');
 
 // Create logger for account module
 const logger = createLogger('account');
+const { VaultLeaseManager } = require('./vaultLeaseManager');
 
 /**
  * Loads the keeper's keypair and validates its on-chain state.
@@ -284,12 +286,25 @@ async function createHsmSigner(opts = {}) {
 
   if (providerType === 'vault-transit') {
     const { VaultTransitProvider } = require('./hsm/vaultTransitProvider');
+    const leaseManager = opts.leaseManager || ((!opts.vaultToken && !process.env.VAULT_TOKEN)
+      ? new VaultLeaseManager({
+        primary: opts.vaultAddr || process.env.VAULT_ADDR,
+        secondary: opts.vaultSecondaryAddr || process.env.VAULT_SECONDARY_ADDR,
+        authMethod: opts.vaultAuthMethod || process.env.VAULT_AUTH_METHOD,
+        roleId: opts.vaultRoleId || process.env.VAULT_ROLE_ID,
+        secretId: opts.vaultSecretId || process.env.VAULT_SECRET_ID,
+        kubernetesRole: opts.vaultKubernetesRole || process.env.VAULT_K8S_ROLE,
+        kubernetesJwtPath: opts.vaultKubernetesJwtPath || process.env.VAULT_K8S_JWT_PATH,
+        logger: opts.logger,
+      }) : null);
     const hsmProvider = opts.hsmProvider || new VaultTransitProvider({
       vaultAddr: opts.vaultAddr || process.env.VAULT_ADDR,
       vaultToken: opts.vaultToken || process.env.VAULT_TOKEN,
       transitPath: opts.transitPath || process.env.VAULS_TRANSIT_PATH,
       logger: opts.logger,
+      leaseManager,
     });
+    if (leaseManager) await leaseManager.start();
     const signer = new MultiSigHSMSigner(
       hsmProvider,
       [keyId],
@@ -370,7 +385,8 @@ async function initializeKeeperAccount(opts = {}) {
     const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
     const server = new Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
     const accountResponse = await server.getAccount(publicKey);
-    return { keypair, accountResponse, hsmSigner };
+    const gasTracker = opts.gasTracker || getAdaptiveGasTracker();
+    return { keypair, accountResponse, hsmSigner, gasTracker };
   }
 
   // Local signer mode: load the secret from the configured provider.
@@ -385,7 +401,79 @@ async function initializeKeeperAccount(opts = {}) {
   const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
   const server = new Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
   const accountResponse = await server.getAccount(publicKey);
-  return { keypair, accountResponse };
+  const gasTracker = opts.gasTracker || getAdaptiveGasTracker();
+  return { keypair, accountResponse, gasTracker };
+}
+
+/**
+ * Forecast the optimal inclusion fee 3 ledgers in advance for transactions signed by the keeper account (#1439).
+ * @param {object} [options]
+ * @returns {object}
+ */
+function forecastAccountInclusionFee(options = {}) {
+  const tracker = options.gasTracker || getAdaptiveGasTracker();
+  return tracker.forecastInclusionFee(options);
+}
+
+/**
+ * Record a ledger fee observation on the keeper account's adaptive gas tracker (#1439).
+ * @param {object|number} sample
+ * @param {AdaptiveGasTracker} [tracker]
+ */
+function recordAccountLedgerFee(sample, tracker = getAdaptiveGasTracker()) {
+  return tracker.recordLedgerSample(sample);
+}
+
+/**
+ * Batch verify signatures for Stellar transactions and account actions (#1446)
+ * Uses high-performance SIMD/FFI accelerated verifier with seamless Node.js crypto fallback.
+ *
+ * @param {Array<{ signature: Buffer, messageHash: Buffer, publicKey: string|Buffer }>} items
+ * @param {Object} [options]
+ * @returns {{ valid: boolean[], allValid: boolean, verifiedCount: number, errorCount: number }}
+ */
+function verifyAccountBatchSignatures(items, options = {}) {
+  const { getSignatureVerifier } = require('./crypto/signatureVerifier');
+  const verifier = (options && options.verifier) || getSignatureVerifier();
+
+  const batch = items.map((item) => {
+    let rawPub = item.publicKey;
+    if (typeof rawPub === 'string' && rawPub.startsWith('G')) {
+      try {
+        rawPub = StrKey.decodeEd25519PublicKey(rawPub);
+      } catch (_e) {
+        // fallback to original string if not StrKey encoded
+      }
+    }
+    return {
+      message: item.messageHash || item.message,
+      signature: item.signature,
+      publicKey: rawPub,
+    };
+  });
+
+  return verifier.batchVerifyEd25519(batch);
+}
+
+/**
+ * Batch verify multiple signatures against a single transaction hash
+ * @param {Array<Buffer>} signatures
+ * @param {Buffer} messageHash
+ * @param {Array<string|Buffer>} publicKeys
+ * @param {Object} [options]
+ * @returns {boolean} True if all signatures are valid
+ */
+function batchVerifyStellarSignatures(signatures, messageHash, publicKeys, options = {}) {
+  if (!Array.isArray(signatures) || !Array.isArray(publicKeys) || signatures.length !== publicKeys.length) {
+    return false;
+  }
+  const items = signatures.map((sig, idx) => ({
+    signature: sig,
+    messageHash,
+    publicKey: publicKeys[idx],
+  }));
+  const result = verifyAccountBatchSignatures(items, options);
+  return result.allValid;
 }
 
 module.exports = {
@@ -399,4 +487,11 @@ module.exports = {
   fetchSecretFromVault,
   fetchSecretFromAWS,
   clearSecretMemory,
+  VaultLeaseManager,
+  verifyAccountBatchSignatures,
+  batchVerifyStellarSignatures,
+  AdaptiveGasTracker,
+  getAdaptiveGasTracker,
+  forecastAccountInclusionFee,
+  recordAccountLedgerFee,
 };
