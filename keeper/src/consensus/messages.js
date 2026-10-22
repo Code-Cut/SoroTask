@@ -22,6 +22,12 @@ const MESSAGE_TYPES = {
   RESULT: 'result',
   // Nack: reject a proposal (used for conflict resolution)
   NACK: 'nack',
+  // Kademlia DHT discovery (issue #1470): iterative node lookup request
+  FIND_NODE: 'find_node',
+  // Kademlia DHT discovery (issue #1470): closest-contact response
+  NODES: 'nodes',
+  // Kademlia join announcement gossiped when a node enters the cluster
+  JOIN: 'join',
 };
 
 /**
@@ -177,6 +183,41 @@ function createResultMessage(taskId, executorId, success, metadata, secret) {
 }
 
 /**
+ * FIND_NODE message: Kademlia iterative lookup request (issue #1470)
+ * @param {string} targetId - Node id being looked up
+ * @param {number} epoch - Current epoch
+ * @param {string} requesterId - Keeper issuing the lookup
+ * @param {string} secret - HMAC secret
+ * @returns {Object} Signed find_node message
+ */
+function createFindNodeMessage(targetId, epoch, requesterId, secret) {
+  return createMessage(
+    MESSAGE_TYPES.FIND_NODE,
+    { taskId: targetId, epoch, metadata: { targetId } },
+    requesterId,
+    secret,
+  );
+}
+
+/**
+ * NODES message: closest-contact response to a FIND_NODE lookup (issue #1470)
+ * @param {string} targetId - Node id that was looked up
+ * @param {Array<Object>} contacts - Closest contacts [{id, address, stake}]
+ * @param {number} epoch - Current epoch
+ * @param {string} responderId - Keeper responding with contacts
+ * @param {string} secret - HMAC secret
+ * @returns {Object} Signed nodes message
+ */
+function createNodesMessage(targetId, contacts, epoch, responderId, secret) {
+  return createMessage(
+    MESSAGE_TYPES.NODES,
+    { taskId: targetId, epoch, metadata: { targetId, contacts } },
+    responderId,
+    secret,
+  );
+}
+
+/**
  * Packaging and verification helpers for Noise encrypted consensus envelopes (#1440)
  */
 
@@ -317,6 +358,8 @@ module.exports = {
   createVoteMessage,
   createCommitMessage,
   createResultMessage,
+  createFindNodeMessage,
+  createNodesMessage,
   createNoiseEncryptedEnvelope,
   decryptNoiseEnvelope,
   verifyPeerIdentity,
